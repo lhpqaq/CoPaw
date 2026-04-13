@@ -15,14 +15,10 @@ class RedoCommandHandler(BaseControlCommandHandler):
             return "❌ /redo failed: No workspace attached."
 
         snapshot_svc = SnapshotService(context.workspace.workspace_dir)
-        latest_undone = await snapshot_svc.get_latest_undone()
-
-        if not latest_undone:
+        status, entry = await snapshot_svc.redo_latest()
+        if status == "empty" or entry is None:
             return "⚠️ No undone rollback history available to redo."
-
-        # Safety check: avoid overwriting out-of-band workspace changes.
-        current_hash = await snapshot_svc.track()
-        if current_hash != latest_undone.before_hash:
+        if status == "diverged":
             return (
                 "❌ **Redo Blocked**\n"
                 "The workspace has changed since the last agent operation. "
@@ -30,21 +26,10 @@ class RedoCommandHandler(BaseControlCommandHandler):
                 "Please manually resolve or discard your changes before "
                 "running `/redo`."
             )
-
-        # Proceed with redo (applying the 'after_hash' state)
-        success = await snapshot_svc.revert(
-            target_hash=latest_undone.after_hash,
-            files=latest_undone.files,
-        )
-
-        if not success:
+        if status == "failed":
             return "❌ /redo failed: Could not re-apply all files."
-
-        # Mark entry as applied
-        await snapshot_svc.mark_applied(latest_undone.id)
-
-        file_list = "\n".join([f"- {f}" for f in latest_undone.files])
+        file_list = "\n".join(f"- {path}" for path in entry.files)
         return (
             f"✅ **Redo Successful**\n\n"
-            f"Re-applied {len(latest_undone.files)} file(s):\n{file_list}"
+            f"Re-applied {len(entry.files)} file(s):\n{file_list}"
         )

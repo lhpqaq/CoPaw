@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Workspace snapshot and rollback support."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -9,43 +11,63 @@ import shutil
 import subprocess
 import time
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, cast
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback handled below
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX fallback handled above
+    msvcrt = None
 
 logger = logging.getLogger(__name__)
+
+_UNDO_OK = "ok"
+_UNDO_EMPTY = "empty"
+_UNDO_DIVERGED = "diverged"
+_UNDO_FAILED = "failed"
 
 
 @dataclass
 class RollbackEntry:
+    """A single linear workspace rollback record."""
+
     id: str
     session_id: str
     before_hash: str
     after_hash: str
-    files: List[str]
+    files: list[str]
     created_at: float
-    status: str  # 'applied' or 'undone'
+    status: str  # "applied" or "undone"
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the entry for JSON persistence."""
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "RollbackEntry":
-        return cls(**data)
+    def from_dict(cls, data: dict[str, Any]) -> RollbackEntry:
+        """Deserialize an entry from JSON payload."""
+        return cls(**cast(dict[str, Any], data))
 
 
 class SnapshotService:
     """Workspace-level file snapshot and rollback service."""
 
-    _locks: Dict[Path, asyncio.Lock] = defaultdict(asyncio.Lock)
+    _locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
     def __init__(self, workspace_dir: Path):
-        self.workspace_dir = workspace_dir
+        self.workspace_dir = Path(workspace_dir).expanduser().resolve()
         self.rollback_dir = self.workspace_dir / ".copaw" / "rollback"
         self.git_dir = self.rollback_dir / "git"
         self.history_file = self.rollback_dir / "history.json"
-
-        # Git config to prevent interference with user's global settings
+        self.lock_file = self.rollback_dir / "workspace.lock"
+        self._lock_key = str(self.workspace_dir)
         self._git_env = {
             **os.environ,
             "GIT_CONFIG_GLOBAL": "",
@@ -56,21 +78,65 @@ class SnapshotService:
             "GIT_COMMITTER_EMAIL": "copaw@localhost",
         }
 
-    async def _run_git(self, *args: str) -> Tuple[int, str, str]:
-        """Run a git command using the separate git-dir and work-tree."""
-        cmd = [
+    @staticmethod
+    def _acquire_file_lock(handle) -> None:
+        """Take an exclusive cross-process workspace lock."""
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            return
+        if msvcrt is not None:  # pragma: no cover - Windows only
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+
+    @staticmethod
+    def _release_file_lock(handle) -> None:
+        """Release the cross-process workspace lock."""
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            return
+        if msvcrt is not None:  # pragma: no cover - Windows only
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+    @asynccontextmanager
+    async def _workspace_lock(self):
+        """Serialize workspace rollback state across tasks and processes."""
+        self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        self.rollback_dir.mkdir(parents=True, exist_ok=True)
+        async with self._locks[self._lock_key]:
+            with open(self.lock_file, "a+b") as handle:
+                await asyncio.to_thread(self._acquire_file_lock, handle)
+                try:
+                    yield
+                finally:
+                    await asyncio.to_thread(
+                        self._release_file_lock,
+                        handle,
+                    )
+
+    def _git_cmd(self, *args: str) -> list[str]:
+        return [
             "git",
             "--git-dir",
             str(self.git_dir),
             "--work-tree",
             str(self.workspace_dir),
-            "-c", "core.autocrlf=false",
-            "-c", "core.longpaths=true",
-            "-c", "core.symlinks=true",
-            "-c", "core.quotepath=false",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.longpaths=true",
+            "-c",
+            "core.symlinks=true",
+            "-c",
+            "core.quotepath=false",
             *args,
         ]
 
+    async def _run_command(
+        self,
+        cmd: list[str],
+    ) -> tuple[int, str, str]:
+        """Run a subprocess and return (code, stdout, stderr)."""
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=subprocess.PIPE,
@@ -79,204 +145,301 @@ class SnapshotService:
             cwd=str(self.workspace_dir),
         )
         stdout, stderr = await process.communicate()
-
-        if process.returncode != 0:
-            logger.debug(
-                f"git {' '.join(args)} failed with {process.returncode}:\n"
-                f"{stderr.decode()}",
-            )
-
         return (
             process.returncode or 0,
             stdout.decode().strip(),
             stderr.decode().strip(),
         )
 
-    async def init(self) -> None:
-        """Initialize the git-dir if it doesn't exist and set up exclusions."""
-        async with self._locks[self.workspace_dir]:
-            if not self.git_dir.exists():
-                self.git_dir.parent.mkdir(parents=True, exist_ok=True)
-                # init as a bare repo
-                await self._run_git("init", "--bare", str(self.git_dir))
-
-            # set up info/exclude
-            info_dir = self.git_dir / "info"
-            info_dir.mkdir(exist_ok=True)
-
-            # Exclude CoPaw internal files and common noise
-            exclusions = [
-                ".copaw/",
-                "sessions/",
-                ".git/",
-                "node_modules/",
-                "venv/",
-                ".venv/",
-                "__pycache__/",
-                ".pytest_cache/",
-            ]
-
-            with open(info_dir / "exclude", "w", encoding="utf-8") as f:
-                f.write("\n".join(exclusions) + "\n")
-
-    async def track(self) -> Optional[str]:
-        """Take a snapshot of the current workspace."""
-        await self.init()
-        async with self._locks[self.workspace_dir]:
-            # Add all files (respecting info/exclude)
-            ret, _, _ = await self._run_git("add", "--sparse", ".")
-            if ret != 0:
-                logger.warning("Failed to add files to snapshot")
-                return None
-
-            # Write the tree object and get its hash
-            ret, stdout, stderr = await self._run_git("write-tree")
-            if ret != 0:
-                logger.warning(f"Failed to write tree: {stderr}")
-                return None
-
-            return stdout
-
-    async def patch(self, base_hash: str) -> List[str]:
-        """Compute file paths changed since ``base_hash``."""
-        async with self._locks[self.workspace_dir]:
-            # Ensure the index is up-to-date
-            await self._run_git("add", "--sparse", ".")
-
-            # Diff against the base hash
-            ret, stdout, stderr = await self._run_git(
-                "diff",
-                "--cached",
-                "--no-ext-diff",
-                "--name-only",
-                base_hash,
-                "--",
-                ".",
+    async def _run_git(self, *args: str) -> tuple[int, str, str]:
+        """Run git against the internal git-dir/work-tree pair."""
+        code, stdout, stderr = await self._run_command(self._git_cmd(*args))
+        if code != 0:
+            logger.debug(
+                "git %s failed with %s:\n%s",
+                " ".join(args),
+                code,
+                stderr,
             )
+        return code, stdout, stderr
 
-            if ret != 0:
-                logger.warning(f"Failed to get patch diff: {stderr}")
-                return []
-
-            files = [f.strip() for f in stdout.split("\n") if f.strip()]
-            return files
-
-    async def revert(  # pylint: disable=too-many-nested-blocks
-        self,
-        target_hash: str,
-        files: List[str],
-    ) -> bool:
-        """Revert the specified files to their state in target_hash."""
-        if not files:
+    async def _bootstrap_git_dir_locked(self) -> bool:
+        """Create the internal git-dir once for this workspace."""
+        if (self.git_dir / "HEAD").exists():
             return True
 
-        async with self._locks[self.workspace_dir]:
-            success = True
-            for file_path in files:
-                logger.info(
-                    "Reverting %s to state from %s",
+        self.git_dir.parent.mkdir(parents=True, exist_ok=True)
+        code, _, stderr = await self._run_command(
+            ["git", "init", "--bare", str(self.git_dir)],
+        )
+        if code != 0:
+            logger.warning(
+                "Failed to initialize rollback git-dir: %s",
+                stderr,
+            )
+            return False
+        return True
+
+    def _write_excludes_locked(self) -> None:
+        """Exclude CoPaw runtime noise from rollback snapshots."""
+        info_dir = self.git_dir / "info"
+        info_dir.mkdir(parents=True, exist_ok=True)
+        exclusions = [
+            ".copaw/",
+            ".git/",
+            "agent.json",
+            "sessions/",
+            "chat.json",
+            "chats.json",
+            "dialog/",
+            "file_store/",
+            "memory/",
+            "memory_file_metadata.json",
+            "skill.json",
+            ".skill.json.lock",
+            "token_usage.json",
+            ".reme_store_*",
+            "node_modules/",
+            "venv/",
+            ".venv/",
+            "__pycache__/",
+            ".pytest_cache/",
+        ]
+        with open(
+            info_dir / "exclude",
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("\n".join(exclusions) + "\n")
+
+    async def _stage_all_locked(self) -> bool:
+        """Refresh the index from the current workspace state."""
+        code, _, stderr = await self._run_git("add", "-A", "--", ".")
+        if code != 0:
+            logger.warning("Failed to add files to snapshot: %s", stderr)
+            return False
+        return True
+
+    async def _write_tree_locked(self) -> str | None:
+        """Write and return the current tree hash."""
+        code, stdout, stderr = await self._run_git("write-tree")
+        if code != 0:
+            logger.warning("Failed to write tree: %s", stderr)
+            return None
+        return stdout
+
+    async def _track_locked(self) -> str | None:
+        """Capture the current workspace tree under the service lock."""
+        if not await self._stage_all_locked():
+            return None
+        return await self._write_tree_locked()
+
+    async def _patch_locked(self, base_hash: str) -> list[str]:
+        """Compute changed files since ``base_hash`` under the lock."""
+        if not await self._stage_all_locked():
+            return []
+
+        code, stdout, stderr = await self._run_git(
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--name-only",
+            base_hash,
+            "--",
+            ".",
+        )
+        if code != 0:
+            logger.warning("Failed to get patch diff: %s", stderr)
+            return []
+        return [item.strip() for item in stdout.splitlines() if item.strip()]
+
+    async def _files_match_tree_locked(
+        self,
+        target_hash: str,
+        files: list[str],
+    ) -> bool:
+        """Return whether current workspace matches target tree for files."""
+        if not files:
+            return True
+        if not await self._stage_all_locked():
+            return False
+
+        code, _, stderr = await self._run_git(
+            "diff",
+            "--cached",
+            "--quiet",
+            target_hash,
+            "--",
+            *files,
+        )
+        if code == 0:
+            return True
+        if code == 1:
+            return False
+        logger.warning("Failed to validate rollback divergence: %s", stderr)
+        return False
+
+    async def _path_exists_in_tree_locked(
+        self,
+        target_hash: str,
+        file_path: str,
+    ) -> bool:
+        """Return whether ``file_path`` exists in ``target_hash``."""
+        code, stdout, _ = await self._run_git(
+            "ls-tree",
+            target_hash,
+            "--",
+            file_path,
+        )
+        return code == 0 and bool(stdout.strip())
+
+    async def _revert_locked(
+        self,
+        target_hash: str,
+        files: list[str],
+    ) -> bool:
+        """Restore ``files`` to the state stored in ``target_hash``."""
+        success = True
+        for file_path in files:
+            logger.info(
+                "Reverting %s to state from %s",
+                file_path,
+                target_hash,
+            )
+            code, _, _ = await self._run_git(
+                "checkout",
+                target_hash,
+                "--",
+                file_path,
+            )
+            if code == 0:
+                continue
+
+            if await self._path_exists_in_tree_locked(target_hash, file_path):
+                logger.warning(
+                    "Failed to checkout %s from %s",
                     file_path,
                     target_hash,
                 )
+                success = False
+                continue
 
-                # Try to checkout the file from the target tree
-                ret, _, _ = await self._run_git(
-                    "checkout",
-                    target_hash,
-                    "--",
+            full_path = self.workspace_dir / file_path
+            if not full_path.exists():
+                continue
+
+            try:
+                if full_path.is_dir():
+                    shutil.rmtree(full_path)
+                else:
+                    full_path.unlink()
+            except OSError as exc:
+                logger.warning(
+                    "Failed to delete %s: %s",
                     file_path,
+                    exc,
                 )
+                success = False
+        return success
 
-                if ret != 0:
-                    # Checkout failed, which usually means the file did not
-                    # exist in the target snapshot.
-                    # Verify it didn't exist
-                    ret_ls, stdout_ls, _ = await self._run_git(
-                        "ls-tree",
-                        target_hash,
-                        "--",
-                        file_path,
-                    )
-
-                    if ret_ls == 0 and stdout_ls.strip():
-                        # File did exist, checkout just failed for some reason
-                        logger.warning(
-                            "Failed to checkout %s from %s",
-                            file_path,
-                            target_hash,
-                        )
-                        success = False
-                    else:
-                        logger.info(
-                            "File %s did not exist in %s, deleting it",
-                            file_path,
-                            target_hash,
-                        )
-                        full_path = self.workspace_dir / file_path
-                        if full_path.exists():
-                            try:
-                                if full_path.is_dir():
-                                    shutil.rmtree(full_path)
-                                else:
-                                    full_path.unlink()
-                            except Exception as e:
-                                logger.warning(
-                                    "Failed to delete %s: %s",
-                                    file_path,
-                                    e,
-                                )
-                                success = False
-
-            return success
-
-    # --- History Management ---
-
-    async def _load_history(self) -> List[RollbackEntry]:
+    async def _load_history_locked(self) -> list[RollbackEntry]:
         if not self.history_file.exists():
             return []
         try:
-            with open(self.history_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return [RollbackEntry.from_dict(entry) for entry in data]
-        except Exception as e:
-            logger.warning(f"Failed to load rollback history: {e}")
+            with open(
+                self.history_file,
+                "r",
+                encoding="utf-8",
+            ) as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Failed to load rollback history: %s", exc)
             return []
+        return [RollbackEntry.from_dict(entry) for entry in payload]
 
-    async def _save_history(self, history: List[RollbackEntry]) -> None:
+    async def _save_history_locked(
+        self,
+        history: list[RollbackEntry],
+    ) -> None:
         self.history_file.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with open(self.history_file, "w", encoding="utf-8") as f:
-                json.dump([entry.to_dict() for entry in history], f, indent=2)
-        except Exception as e:
-            logger.warning(f"Failed to save rollback history: {e}")
+            with open(
+                self.history_file,
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                json.dump(
+                    [entry.to_dict() for entry in history],
+                    handle,
+                    indent=2,
+                )
+        except OSError as exc:
+            logger.warning("Failed to save rollback history: %s", exc)
 
-    async def add_history_entry(
+    @staticmethod
+    def _latest_applied(
+        history: list[RollbackEntry],
+    ) -> RollbackEntry | None:
+        applied = [entry for entry in history if entry.status == "applied"]
+        return applied[-1] if applied else None
+
+    @staticmethod
+    def _latest_undone(
+        history: list[RollbackEntry],
+    ) -> RollbackEntry | None:
+        undone = [entry for entry in history if entry.status == "undone"]
+        return undone[0] if undone else None
+
+    async def init(self) -> None:
+        """Initialize the internal git-dir and exclusions."""
+        async with self._workspace_lock():
+            if await self._bootstrap_git_dir_locked():
+                self._write_excludes_locked()
+
+    async def track(self) -> str | None:
+        """Take a snapshot of the current workspace."""
+        await self.init()
+        async with self._workspace_lock():
+            return await self._track_locked()
+
+    async def patch(self, base_hash: str) -> list[str]:
+        """Compute file paths changed since ``base_hash``."""
+        await self.init()
+        async with self._workspace_lock():
+            return await self._patch_locked(base_hash)
+
+    async def revert(self, target_hash: str, files: list[str]) -> bool:
+        """Revert the specified files to their state in ``target_hash``."""
+        if not files:
+            return True
+
+        await self.init()
+        async with self._workspace_lock():
+            return await self._revert_locked(target_hash, files)
+
+    async def record_history_if_changed(
         self,
         session_id: str,
-        before_hash: str,
-        after_hash: str,
-        files: List[str],
-    ) -> None:
-        """Add a new applied entry to the rollback history."""
-        # Keep history mutations under the workspace lock so appends and
-        # truncation stay linear.
-        # But callers must make sure they don't hold the outer lock.
-        async with self._locks[self.workspace_dir]:
-            history = await self._load_history()
+        before_hash: str | None,
+    ) -> RollbackEntry | None:
+        """Persist a linear rollback entry when workspace files changed."""
+        if not before_hash:
+            return None
 
-            # Truncate any undone entries when appending a new linear commit.
-            # We want to keep everything before the current 'applied' tail.
-            new_history = []
-            for h in history:
-                if h.status == "applied":
-                    new_history.append(h)
-                else:
-                    # found first undone, we discard it and everything after
-                    break
+        await self.init()
+        async with self._workspace_lock():
+            after_hash = await self._track_locked()
+            if not after_hash or after_hash == before_hash:
+                return None
 
-            entry_id = f"rev_{len(new_history) + 1}_{int(time.time())}"
+            files = await self._patch_locked(before_hash)
+            if not files:
+                return None
+
+            history = await self._load_history_locked()
+            history = [entry for entry in history if entry.status == "applied"]
             new_entry = RollbackEntry(
-                id=entry_id,
+                id=f"rev_{len(history) + 1}_{int(time.time())}",
                 session_id=session_id,
                 before_hash=before_hash,
                 after_hash=after_hash,
@@ -284,40 +447,115 @@ class SnapshotService:
                 created_at=time.time(),
                 status="applied",
             )
+            history.append(new_entry)
+            await self._save_history_locked(history)
+            return new_entry
 
-            new_history.append(new_entry)
-            await self._save_history(new_history)
+    async def add_history_entry(
+        self,
+        session_id: str,
+        before_hash: str,
+        after_hash: str,
+        files: list[str],
+    ) -> None:
+        """Add a new applied entry to the rollback history."""
+        await self.init()
+        async with self._workspace_lock():
+            history = await self._load_history_locked()
+            history = [entry for entry in history if entry.status == "applied"]
+            history.append(
+                RollbackEntry(
+                    id=f"rev_{len(history) + 1}_{int(time.time())}",
+                    session_id=session_id,
+                    before_hash=before_hash,
+                    after_hash=after_hash,
+                    files=files,
+                    created_at=time.time(),
+                    status="applied",
+                ),
+            )
+            await self._save_history_locked(history)
 
-    async def get_latest_applied(self) -> Optional[RollbackEntry]:
-        """Get the most recent applied entry (for undo)."""
-        async with self._locks[self.workspace_dir]:
-            history = await self._load_history()
-            applied = [h for h in history if h.status == "applied"]
-            return applied[-1] if applied else None
+    async def get_latest_applied(self) -> RollbackEntry | None:
+        """Get the most recent applied entry."""
+        await self.init()
+        async with self._workspace_lock():
+            return self._latest_applied(await self._load_history_locked())
 
-    async def get_latest_undone(self) -> Optional[RollbackEntry]:
-        """Get the most recent undone entry (for redo)."""
-        async with self._locks[self.workspace_dir]:
-            history = await self._load_history()
-            undone = [h for h in history if h.status == "undone"]
-            return undone[0] if undone else None
+    async def get_latest_undone(self) -> RollbackEntry | None:
+        """Get the next redo entry from the linear history."""
+        await self.init()
+        async with self._workspace_lock():
+            return self._latest_undone(await self._load_history_locked())
 
     async def mark_undone(self, entry_id: str) -> None:
         """Mark a specific entry as undone."""
-        async with self._locks[self.workspace_dir]:
-            history = await self._load_history()
+        await self.init()
+        async with self._workspace_lock():
+            history = await self._load_history_locked()
             for entry in history:
                 if entry.id == entry_id:
                     entry.status = "undone"
                     break
-            await self._save_history(history)
+            await self._save_history_locked(history)
 
     async def mark_applied(self, entry_id: str) -> None:
         """Mark a specific entry as applied."""
-        async with self._locks[self.workspace_dir]:
-            history = await self._load_history()
+        await self.init()
+        async with self._workspace_lock():
+            history = await self._load_history_locked()
             for entry in history:
                 if entry.id == entry_id:
                     entry.status = "applied"
                     break
-            await self._save_history(history)
+            await self._save_history_locked(history)
+
+    async def undo_latest(self) -> tuple[str, RollbackEntry | None]:
+        """Undo the latest applied workspace change atomically."""
+        await self.init()
+        async with self._workspace_lock():
+            history = await self._load_history_locked()
+            entry = self._latest_applied(history)
+            if entry is None:
+                return _UNDO_EMPTY, None
+
+            if not await self._files_match_tree_locked(
+                entry.after_hash,
+                entry.files,
+            ):
+                return _UNDO_DIVERGED, entry
+
+            if not await self._revert_locked(entry.before_hash, entry.files):
+                return _UNDO_FAILED, entry
+
+            for item in history:
+                if item.id == entry.id:
+                    item.status = "undone"
+                    break
+            await self._save_history_locked(history)
+            return _UNDO_OK, entry
+
+    async def redo_latest(self) -> tuple[str, RollbackEntry | None]:
+        """Redo the next undone workspace change atomically."""
+        await self.init()
+        async with self._workspace_lock():
+            history = await self._load_history_locked()
+            entry = self._latest_undone(history)
+            if entry is None:
+                return _UNDO_EMPTY, None
+
+            if not await self._files_match_tree_locked(
+                entry.before_hash,
+                entry.files,
+            ):
+                return _UNDO_DIVERGED, entry
+
+            if not await self._revert_locked(entry.after_hash, entry.files):
+                return _UNDO_FAILED, entry
+
+            for item in history:
+                if item.id == entry.id:
+                    item.status = "applied"
+                    break
+            await self._save_history_locked(history)
+            return _UNDO_OK, entry

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # pylint: disable=redefined-outer-name
 
+import asyncio
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -16,118 +17,208 @@ def temp_workspace():
         yield workspace_dir
 
 
-@pytest.mark.asyncio
-async def test_snapshot_service_init_and_track(temp_workspace):
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def test_snapshot_service_init_and_track(temp_workspace):
     svc = SnapshotService(temp_workspace)
 
-    # Init
-    await svc.init()
-    assert svc.git_dir.exists()
+    _run(svc.init())
+    assert (svc.git_dir / "HEAD").exists()
     assert (svc.git_dir / "info" / "exclude").exists()
 
-    # Create a test file
     test_file = temp_workspace / "test.txt"
-    test_file.write_text("hello world")
+    test_file.write_text("hello world", encoding="utf-8")
 
-    # Track
-    hash1 = await svc.track()
+    hash1 = _run(svc.track())
     assert hash1 is not None
 
-    # Modify file
-    test_file.write_text("hello modified")
+    test_file.write_text("hello modified", encoding="utf-8")
 
-    # Track again
-    hash2 = await svc.track()
+    hash2 = _run(svc.track())
     assert hash2 is not None
     assert hash1 != hash2
 
 
-@pytest.mark.asyncio
-async def test_snapshot_service_patch(temp_workspace):
+def test_snapshot_service_excludes_runtime_files(temp_workspace):
+    svc = SnapshotService(temp_workspace)
+    user_file = temp_workspace / "keep.txt"
+    user_file.write_text("payload", encoding="utf-8")
+
+    hash1 = _run(svc.track())
+
+    sessions_dir = temp_workspace / "sessions"
+    sessions_dir.mkdir()
+    (sessions_dir / "state.json").write_text("{}", encoding="utf-8")
+    (temp_workspace / "agent.json").write_text("{}", encoding="utf-8")
+    (temp_workspace / "chats.json").write_text("{}", encoding="utf-8")
+    (temp_workspace / "token_usage.json").write_text("[]", encoding="utf-8")
+    memory_dir = temp_workspace / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "note.md").write_text("runtime memory", encoding="utf-8")
+    (temp_workspace / ".reme_store_v1").write_text("", encoding="utf-8")
+
+    hash2 = _run(svc.track())
+    assert hash1 == hash2
+
+
+def test_snapshot_service_patch(temp_workspace):
     svc = SnapshotService(temp_workspace)
 
-    # Setup initial state
     f1 = temp_workspace / "f1.txt"
-    f1.write_text("f1")
-    hash1 = await svc.track()
+    f1.write_text("f1", encoding="utf-8")
+    hash1 = _run(svc.track())
 
-    # Modify one file, create another
-    f1.write_text("f1 modified")
+    f1.write_text("f1 modified", encoding="utf-8")
     f2 = temp_workspace / "f2.txt"
-    f2.write_text("f2")
+    f2.write_text("f2", encoding="utf-8")
 
-    # Track again
-    await svc.track()
-
-    # Get patch
-    changed_files = await svc.patch(hash1)
+    changed_files = _run(svc.patch(hash1))
 
     assert "f1.txt" in changed_files
     assert "f2.txt" in changed_files
     assert len(changed_files) == 2
 
 
-@pytest.mark.asyncio
-async def test_snapshot_service_revert(temp_workspace):
+def test_snapshot_service_revert_overwrite_and_new_file(temp_workspace):
     svc = SnapshotService(temp_workspace)
 
-    # Initial state
-    f1 = temp_workspace / "test.txt"
-    f1.write_text("initial")
-    hash1 = await svc.track()
+    original = temp_workspace / "test.txt"
+    original.write_text("initial", encoding="utf-8")
+    hash1 = _run(svc.track())
 
-    # Changed state
-    f1.write_text("changed")
-    f2 = temp_workspace / "new.txt"
-    f2.write_text("new")
+    original.write_text("changed", encoding="utf-8")
+    created = temp_workspace / "new.txt"
+    created.write_text("new", encoding="utf-8")
 
-    patch_files = await svc.patch(hash1)
-
-    # Revert to hash1
-    success = await svc.revert(hash1, patch_files)
+    patch_files = _run(svc.patch(hash1))
+    success = _run(svc.revert(hash1, patch_files))
 
     assert success
-    assert f1.read_text() == "initial"
-    assert not f2.exists()
+    assert original.read_text(encoding="utf-8") == "initial"
+    assert not created.exists()
 
 
-@pytest.mark.asyncio
-async def test_snapshot_service_history(temp_workspace):
+def test_record_history_if_changed_creates_linear_entry(temp_workspace):
     svc = SnapshotService(temp_workspace)
+    file_path = temp_workspace / "note.txt"
+    file_path.write_text("v1", encoding="utf-8")
+    before_hash = _run(svc.track())
 
-    f1 = temp_workspace / "test.txt"
+    file_path.write_text("v2", encoding="utf-8")
+    entry = _run(svc.record_history_if_changed("sess1", before_hash))
 
-    # State 1
-    f1.write_text("state1")
-    hash1 = await svc.track()
+    assert entry is not None
+    assert entry.session_id == "sess1"
+    assert entry.before_hash == before_hash
+    assert entry.after_hash != before_hash
+    assert entry.files == ["note.txt"]
 
-    # State 2
-    f1.write_text("state2")
-    hash2 = await svc.track()
-    patch2 = await svc.patch(hash1)
-    await svc.add_history_entry("sess1", hash1, hash2, patch2)
-
-    # Check latest applied
-    latest = await svc.get_latest_applied()
+    latest = _run(svc.get_latest_applied())
     assert latest is not None
-    assert latest.before_hash == hash1
-    assert latest.after_hash == hash2
-    assert latest.files == patch2
-    assert latest.status == "applied"
+    assert latest.id == entry.id
 
-    # Mark undone
-    await svc.mark_undone(latest.id)
 
-    # Check latest undone
-    undone = await svc.get_latest_undone()
+def test_undo_restores_deleted_file(temp_workspace):
+    svc = SnapshotService(temp_workspace)
+    target = temp_workspace / "important.txt"
+    target.write_text("keep me", encoding="utf-8")
+    before_hash = _run(svc.track())
+
+    target.unlink()
+    entry = _run(svc.record_history_if_changed("sess1", before_hash))
+    assert entry is not None
+
+    status, undone = _run(svc.undo_latest())
+
+    assert status == "ok"
     assert undone is not None
-    assert undone.id == latest.id
+    assert target.read_text(encoding="utf-8") == "keep me"
 
-    # Add new history after undo should clear undone
-    f1.write_text("state3")
-    hash3 = await svc.track()
-    patch3 = await svc.patch(hash2)  # Workspace state stays at hash2 here.
-    await svc.add_history_entry("sess1", hash2, hash3, patch3)
 
-    undone_after = await svc.get_latest_undone()
-    assert undone_after is None
+def test_undo_and_redo_follow_linear_history(temp_workspace):
+    svc = SnapshotService(temp_workspace)
+    target = temp_workspace / "story.txt"
+    target.write_text("state1", encoding="utf-8")
+
+    before_hash = _run(svc.track())
+    target.write_text("state2", encoding="utf-8")
+    entry1 = _run(svc.record_history_if_changed("sess1", before_hash))
+    assert entry1 is not None
+
+    before_hash = _run(svc.track())
+    target.write_text("state3", encoding="utf-8")
+    entry2 = _run(svc.record_history_if_changed("sess1", before_hash))
+    assert entry2 is not None
+
+    status, _ = _run(svc.undo_latest())
+    assert status == "ok"
+    assert target.read_text(encoding="utf-8") == "state2"
+
+    memory_dir = temp_workspace / "memory"
+    memory_dir.mkdir(exist_ok=True)
+    (memory_dir / "runtime.md").write_text(
+        "should not block undo",
+        encoding="utf-8",
+    )
+    (temp_workspace / "agent.json").write_text(
+        '{"last_dispatch":"runtime"}',
+        encoding="utf-8",
+    )
+    (temp_workspace / ".reme_store_v1").write_text("", encoding="utf-8")
+
+    status, _ = _run(svc.undo_latest())
+    assert status == "ok"
+    assert target.read_text(encoding="utf-8") == "state1"
+
+    status, _ = _run(svc.redo_latest())
+    assert status == "ok"
+    assert target.read_text(encoding="utf-8") == "state2"
+
+    status, _ = _run(svc.redo_latest())
+    assert status == "ok"
+    assert target.read_text(encoding="utf-8") == "state3"
+
+
+def test_undo_is_blocked_when_workspace_diverges(temp_workspace):
+    svc = SnapshotService(temp_workspace)
+    target = temp_workspace / "note.txt"
+    target.write_text("v1", encoding="utf-8")
+    before_hash = _run(svc.track())
+
+    target.write_text("v2", encoding="utf-8")
+    entry = _run(svc.record_history_if_changed("sess1", before_hash))
+    assert entry is not None
+
+    target.write_text("manual edit", encoding="utf-8")
+    status, blocked_entry = _run(svc.undo_latest())
+
+    assert status == "diverged"
+    assert blocked_entry is not None
+    assert target.read_text(encoding="utf-8") == "manual edit"
+
+
+def test_undo_ignores_unrelated_workspace_noise(temp_workspace):
+    svc = SnapshotService(temp_workspace)
+    target = temp_workspace / "note.txt"
+    target.write_text("v1", encoding="utf-8")
+    before_hash = _run(svc.track())
+
+    target.write_text("v2", encoding="utf-8")
+    entry = _run(svc.record_history_if_changed("sess1", before_hash))
+    assert entry is not None
+
+    unrelated = temp_workspace / "dialog" / "session.jsonl"
+    unrelated.parent.mkdir(exist_ok=True)
+    unrelated.write_text("noise", encoding="utf-8")
+    (temp_workspace / "agent.json").write_text(
+        '{"last_dispatch":"runtime"}',
+        encoding="utf-8",
+    )
+    (temp_workspace / "skill.json").write_text("{}", encoding="utf-8")
+
+    status, _ = _run(svc.undo_latest())
+
+    assert status == "ok"
+    assert target.read_text(encoding="utf-8") == "v1"

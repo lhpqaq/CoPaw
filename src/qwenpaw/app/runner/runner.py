@@ -111,6 +111,34 @@ class AgentRunner(Runner):
         """
         self._workspace = workspace
 
+    async def _record_rollback_if_changed(
+        self,
+        snapshot_svc: SnapshotService,
+        session_id: str,
+        before_hash: str | None,
+    ) -> None:
+        """Persist rollback history without masking agent failures."""
+        if not before_hash:
+            return
+
+        try:
+            entry = await snapshot_svc.record_history_if_changed(
+                session_id=session_id,
+                before_hash=before_hash,
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.warning(
+                "Rollback: failed to persist workspace history",
+                exc_info=True,
+            )
+            return
+
+        if entry is not None:
+            logger.info(
+                "Rollback: Saved workspace state (changed %s files)",
+                len(entry.files),
+            )
+
     @staticmethod
     def _parse_skill_query(
         query: str,
@@ -402,6 +430,10 @@ class AgentRunner(Runner):
         agent = None
         chat = None
         session_state_loaded = False
+        before_hash: str | None = None
+        snapshot_svc = SnapshotService(
+            self.workspace_dir if self.workspace_dir else WORKING_DIR,
+        )
         try:
             session_id = request.session_id
             user_id = request.user_id
@@ -538,36 +570,19 @@ class AgentRunner(Runner):
             # in the session state.
             agent.rebuild_sys_prompt()
 
-            # --- Rollback Snapshot: Before Execution ---
-            snapshot_svc = SnapshotService(
-                self.workspace_dir if self.workspace_dir else WORKING_DIR,
-            )
             before_hash = await snapshot_svc.track()
-
-            async for msg, last in stream_printing_messages(
-                agents=[agent],
-                coroutine_task=agent(msgs),
-            ):
-                yield msg, last
-
-            # --- Rollback Snapshot: After Execution ---
-            if before_hash:
-                after_hash = await snapshot_svc.track()
-                if after_hash and before_hash != after_hash:
-                    # Changes detected, compute patch and save history
-                    changed_files = await snapshot_svc.patch(before_hash)
-                    if changed_files:
-                        logger.info(
-                            "Rollback: Saved workspace state "
-                            "(changed %s files)",
-                            len(changed_files),
-                        )
-                        await snapshot_svc.add_history_entry(
-                            session_id=session_id,
-                            before_hash=before_hash,
-                            after_hash=after_hash,
-                            files=changed_files,
-                        )
+            try:
+                async for msg, last in stream_printing_messages(
+                    agents=[agent],
+                    coroutine_task=agent(msgs),
+                ):
+                    yield msg, last
+            finally:
+                await self._record_rollback_if_changed(
+                    snapshot_svc=snapshot_svc,
+                    session_id=session_id,
+                    before_hash=before_hash,
+                )
 
         except asyncio.CancelledError as exc:
             logger.info(f"query_handler: {session_id} cancelled!")
