@@ -96,7 +96,7 @@ class ExpectedCapabilityRegistry:
         """Register a single baseline entry."""
         self._data[(cap.provider_id, cap.model_id)] = cap
 
-    def _load_baseline(self) -> None:
+    def _load_baseline(self) -> None:  # pylint: disable=too-many-statements
         """Load baseline data for built-in providers."""
 
         # ---------------------------------------------------------------
