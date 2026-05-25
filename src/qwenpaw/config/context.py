@@ -56,3 +56,77 @@ def set_current_recent_max_bytes(max_bytes: int | None) -> None:
         max_bytes: Byte limit for recent tool output truncation.
     """
     current_recent_max_bytes.set(max_bytes)
+
+
+# Context variable to store the configured shell command timeout
+current_shell_command_timeout: ContextVar[float | None] = ContextVar(
+    "current_shell_command_timeout",
+    default=None,
+)
+
+
+def get_current_shell_command_timeout() -> float | None:
+    """Get the configured default timeout for execute_shell_command.
+
+    Returns:
+        Timeout in seconds, or None if not configured.
+    """
+    return current_shell_command_timeout.get()
+
+
+def set_current_shell_command_timeout(timeout: float | None) -> None:
+    """Set the configured default timeout for execute_shell_command.
+
+    Args:
+        timeout: Timeout in seconds.
+    """
+    current_shell_command_timeout.set(timeout)
+
+
+current_shell_command_executable: ContextVar[str | None] = ContextVar(
+    "current_shell_command_executable",
+    default=None,
+)
+
+
+def get_current_shell_command_executable() -> str | None:
+    """Get the configured shell executable for execute_shell_command.
+
+    Returns:
+        Path to the shell executable, or None if not configured.
+    """
+    return current_shell_command_executable.get()
+
+
+def set_current_shell_command_executable(executable: str | None) -> None:
+    """Set the configured shell executable for execute_shell_command.
+
+    Args:
+        executable: Path to the shell executable (e.g. "/bin/bash").
+    """
+    current_shell_command_executable.set(executable)
+
+
+# Context variable to store the current session ID for tool functions
+current_session_id: ContextVar[str | None] = ContextVar(
+    "current_session_id",
+    default=None,
+)
+
+
+def get_current_session_id() -> str | None:
+    """Get the current session ID from context.
+
+    Returns:
+        Current session ID, or None if not set.
+    """
+    return current_session_id.get()
+
+
+def set_current_session_id(session_id: str | None) -> None:
+    """Set the current session ID in context.
+
+    Args:
+        session_id: Session ID to store in context.
+    """
+    current_session_id.set(session_id)

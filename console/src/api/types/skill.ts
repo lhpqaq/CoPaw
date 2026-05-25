@@ -17,6 +17,7 @@ export interface SkillSpec {
   config?: Record<string, unknown>;
   last_updated?: string;
   emoji?: string;
+  installed_from?: string;
 }
 
 export interface PoolSkillSpec {
@@ -29,10 +30,21 @@ export interface PoolSkillSpec {
   commit_text?: string;
   sync_status?: SkillSyncStatus | "";
   latest_version_text?: string;
+  builtin_language?: string;
+  available_builtin_languages?: string[];
   tags?: string[];
   config?: Record<string, unknown>;
   last_updated?: string;
   emoji?: string;
+  installed_from?: string;
+}
+
+export interface BuiltinLanguageSpec {
+  language: string;
+  description?: string;
+  version_text?: string;
+  source_name?: string;
+  status?: "missing" | "current" | "outdated" | "conflict" | string;
 }
 
 export interface WorkspaceSkillSummary {
@@ -48,7 +60,28 @@ export interface BuiltinImportSpec {
   version_text?: string;
   current_version_text?: string;
   current_source?: string;
-  status?: "missing" | "current" | "conflict" | string;
+  current_language?: string;
+  available_languages?: string[];
+  languages?: Record<string, BuiltinLanguageSpec>;
+  status?: "missing" | "current" | "outdated" | "conflict" | string;
+}
+
+export interface BuiltinRemovedSpec {
+  name: string;
+  description?: string;
+  current_version_text?: string;
+  current_source?: string;
+}
+
+export interface BuiltinUpdateNotice {
+  fingerprint: string;
+  has_updates: boolean;
+  total_changes: number;
+  actionable_skill_names: string[];
+  added: BuiltinImportSpec[];
+  missing: BuiltinImportSpec[];
+  updated: BuiltinImportSpec[];
+  removed: BuiltinRemovedSpec[];
 }
 
 export interface HubSkillSpec {
@@ -64,7 +97,6 @@ export interface HubInstallTaskResponse {
   bundle_url: string;
   version: string;
   enable: boolean;
-  overwrite: boolean;
   status: "pending" | "importing" | "completed" | "failed" | "cancelled";
   error: string | null;
   result: {
@@ -72,6 +104,7 @@ export interface HubInstallTaskResponse {
     name?: string;
     enabled?: boolean;
     source_url?: string;
+    installed_from?: string;
     conflicts?: Array<{
       reason?: string;
       skill_name?: string;

@@ -1,14 +1,19 @@
 import { useEffect, useState } from "react";
-import { Download, Monitor, Laptop } from "lucide-react";
+import { Download, Laptop, Monitor, Puzzle } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
 import { useSiteConfig } from "@/config-context";
 import "../styles/downloads.css";
 
+const CDN_BASE = "https://download.qwenpaw.agentscope.io";
+
+type LocalizedText = { "zh-CN": string; "en-US": string };
+
 interface FileMetadata {
   id: string;
-  name: { "zh-CN": string; "en-US": string };
-  description: { "zh-CN": string; "en-US": string };
+  plugin_id?: string;
+  name: LocalizedText;
+  description: LocalizedText;
   product: string;
   platform: string;
   version: string;
@@ -19,6 +24,106 @@ interface FileMetadata {
   sha256: string;
   updated_at: string;
   type: string;
+  author?: string;
+}
+
+function pickLocalizedField(
+  value: LocalizedText | undefined,
+  language: string | undefined,
+): string {
+  if (!value) return "";
+  const zh = value["zh-CN"]?.trim() ?? "";
+  const en = value["en-US"]?.trim() ?? "";
+  if (language?.startsWith("zh")) {
+    return zh || en;
+  }
+  return en || zh;
+}
+
+function isPreviewVersion(version: string): boolean {
+  return /[ab]\d*$/i.test(version) || /preview/i.test(version);
+}
+
+function compareVersionPart(a: string, b: string): number {
+  const aNum = Number(a);
+  const bNum = Number(b);
+
+  if (!Number.isNaN(aNum) && !Number.isNaN(bNum)) {
+    return aNum - bNum;
+  }
+
+  return a.localeCompare(b);
+}
+
+function compareVersionDesc(a: string, b: string): number {
+  const aBase = a.match(/^\d+(?:\.\d+)*/)?.[0] ?? "0";
+  const bBase = b.match(/^\d+(?:\.\d+)*/)?.[0] ?? "0";
+  const aParts = aBase.split(".");
+  const bParts = bBase.split(".");
+  const maxLength = Math.max(aParts.length, bParts.length);
+
+  for (let i = 0; i < maxLength; i += 1) {
+    const result = compareVersionPart(aParts[i] ?? "0", bParts[i] ?? "0");
+    if (result !== 0) {
+      return -result;
+    }
+  }
+
+  const aIsPreview = isPreviewVersion(a);
+  const bIsPreview = isPreviewVersion(b);
+  if (aIsPreview !== bIsPreview) {
+    return aIsPreview ? 1 : -1;
+  }
+
+  return b.localeCompare(a);
+}
+
+function latestFileIdByPluginId(files: FileMetadata[]): Map<string, string> {
+  const grouped = new Map<string, FileMetadata[]>();
+  for (const file of files) {
+    const pluginId = file.plugin_id ?? file.id;
+    const list = grouped.get(pluginId) ?? [];
+    list.push(file);
+    grouped.set(pluginId, list);
+  }
+
+  const latest = new Map<string, string>();
+  for (const [pluginId, versions] of grouped) {
+    const sorted = [...versions].sort((a, b) =>
+      compareVersionDesc(a.version, b.version),
+    );
+    const latestStable = sorted.find((item) => !isPreviewVersion(item.version));
+    const chosen = latestStable ?? sorted[0];
+    if (chosen) {
+      latest.set(pluginId, chosen.id);
+    }
+  }
+  return latest;
+}
+
+function groupFilesByPluginId(
+  files: FileMetadata[],
+): Array<{ pluginId: string; versions: FileMetadata[] }> {
+  const grouped = new Map<string, FileMetadata[]>();
+  for (const file of files) {
+    const pluginId = file.plugin_id ?? file.id;
+    const list = grouped.get(pluginId) ?? [];
+    list.push(file);
+    grouped.set(pluginId, list);
+  }
+
+  return Array.from(grouped.entries())
+    .map(([pluginId, versions]) => ({
+      pluginId,
+      versions: [...versions].sort((a, b) =>
+        compareVersionDesc(a.version, b.version),
+      ),
+    }))
+    .sort((a, b) => {
+      const nameA = a.versions[0]?.name["en-US"] ?? a.pluginId;
+      const nameB = b.versions[0]?.name["en-US"] ?? b.pluginId;
+      return nameA.localeCompare(nameB);
+    });
 }
 
 interface PlatformData {
@@ -60,31 +165,44 @@ function detectOS(): string | null {
 }
 
 interface PlatformCardProps {
-  fileMetadata: FileMetadata;
-  allVersions: string[];
+  versions: FileMetadata[];
+  latestStableFileId: string | null;
   isRecommended: boolean;
 }
 
 function PlatformCard({
-  fileMetadata,
-  allVersions,
+  versions,
+  latestStableFileId,
   isRecommended,
 }: PlatformCardProps) {
   const { t, i18n } = useTranslation();
   const isZh = i18n.resolvedLanguage === "zh";
-  const [selectedVersion, setSelectedVersion] = useState(fileMetadata.version);
+  const [selectedFileId, setSelectedFileId] = useState(versions[0]?.id ?? "");
+
+  const selectedFileMetadata =
+    versions.find((item) => item.id === selectedFileId) ?? versions[0];
+
+  if (!selectedFileMetadata) {
+    return null;
+  }
 
   const platformName = isZh
-    ? fileMetadata.name["zh-CN"]
-    : fileMetadata.name["en-US"];
+    ? selectedFileMetadata.name["zh-CN"]
+    : selectedFileMetadata.name["en-US"];
   const description = isZh
-    ? fileMetadata.description["zh-CN"]
-    : fileMetadata.description["en-US"];
-  const IconComponent = platformIcons[fileMetadata.platform] || Monitor;
-  const updatedDate = new Date(fileMetadata.updated_at).toLocaleDateString(
-    isZh ? "zh-CN" : "en-US",
+    ? selectedFileMetadata.description["zh-CN"]
+    : selectedFileMetadata.description["en-US"];
+  const IconComponent = platformIcons[selectedFileMetadata.platform] || Monitor;
+  const updatedDate = new Date(
+    selectedFileMetadata.updated_at,
+  ).toLocaleDateString(isZh ? "zh-CN" : "en-US");
+  const downloadUrl = `${CDN_BASE}${selectedFileMetadata.url}`;
+  const stableVersions = versions.filter(
+    (item) => !/[ab]\d*$/i.test(item.version) && !/preview/i.test(item.version),
   );
-  const downloadUrl = `https://download.qwenpaw.agentscope.io${fileMetadata.url}`;
+  const previewVersions = versions.filter(
+    (item) => /[ab]\d*$/i.test(item.version) || /preview/i.test(item.version),
+  );
 
   return (
     <div className={`platform-card ${isRecommended ? "recommended" : ""}`}>
@@ -101,26 +219,41 @@ function PlatformCard({
               </span>
             )}
           </h4>
-          <div className="platform-version">v{fileMetadata.version}</div>
+          <div className="platform-version">
+            v{selectedFileMetadata.version}
+          </div>
         </div>
       </div>
       <p className="platform-description">{description}</p>
 
-      {allVersions.length > 1 && (
+      {versions.length > 1 && (
         <div className="version-selector">
           <label className="version-label">
             {t("downloads.selectVersion")}
           </label>
           <select
             className="version-dropdown"
-            value={selectedVersion}
-            onChange={(e) => setSelectedVersion(e.target.value)}
+            value={selectedFileId}
+            onChange={(e) => setSelectedFileId(e.target.value)}
           >
-            {allVersions.map((version, index) => (
-              <option key={version} value={version}>
-                v{version} {index === 0 ? `(${t("downloads.latest")})` : ""}
-              </option>
-            ))}
+            {stableVersions.length > 0 &&
+              stableVersions.map((versionItem) => (
+                <option key={versionItem.id} value={versionItem.id}>
+                  v{versionItem.version}
+                  {latestStableFileId === versionItem.id
+                    ? ` (${t("downloads.latest")})`
+                    : ""}
+                </option>
+              ))}
+            {previewVersions.length > 0 && (
+              <optgroup label="Preview">
+                {previewVersions.map((versionItem) => (
+                  <option key={versionItem.id} value={versionItem.id}>
+                    v{versionItem.version}
+                  </option>
+                ))}
+              </optgroup>
+            )}
           </select>
         </div>
       )}
@@ -133,11 +266,11 @@ function PlatformCard({
       <div className="file-details">
         <div className="detail-row">
           <span className="detail-label">{t("downloads.version")}:</span>
-          <span>{fileMetadata.version}</span>
+          <span>{selectedFileMetadata.version}</span>
         </div>
         <div className="detail-row">
           <span className="detail-label">{t("downloads.size")}:</span>
-          <span>{fileMetadata.size}</span>
+          <span>{selectedFileMetadata.size}</span>
         </div>
         <div className="detail-row">
           <span className="detail-label">{t("downloads.updated")}:</span>
@@ -145,9 +278,185 @@ function PlatformCard({
         </div>
         <div className="sha256-row">
           <span className="detail-label">SHA256:</span>
-          <div className="sha256">{fileMetadata.sha256}</div>
+          <div className="sha256">{selectedFileMetadata.sha256}</div>
         </div>
       </div>
+    </div>
+  );
+}
+
+interface PluginCardProps {
+  versions: FileMetadata[];
+  latestStableFileId: string | null;
+  kindLabel: string;
+}
+
+function PluginCard({
+  versions,
+  latestStableFileId,
+  kindLabel,
+}: PluginCardProps) {
+  const { t, i18n } = useTranslation();
+  const language = i18n.resolvedLanguage;
+  const [selectedFileId, setSelectedFileId] = useState(versions[0]?.id ?? "");
+
+  const selected =
+    versions.find((item) => item.id === selectedFileId) ?? versions[0];
+
+  if (!selected) {
+    return null;
+  }
+
+  const name = pickLocalizedField(selected.name, language);
+  const description = pickLocalizedField(selected.description, language);
+  const updatedDate = new Date(selected.updated_at).toLocaleDateString(
+    language?.startsWith("zh") ? "zh-CN" : "en-US",
+  );
+  const downloadUrl = `${CDN_BASE}${selected.url}`;
+  const stableVersions = versions.filter(
+    (item) => !isPreviewVersion(item.version),
+  );
+  const previewVersions = versions.filter((item) =>
+    isPreviewVersion(item.version),
+  );
+
+  return (
+    <div className="platform-card">
+      <div className="platform-header">
+        <div className="platform-icon">
+          <Puzzle size={28} strokeWidth={2} />
+        </div>
+        <div className="platform-info">
+          <h4>
+            {name}
+            <span className="plugin-kind-badge">{kindLabel}</span>
+          </h4>
+          <div className="platform-version">
+            v{selected.version}
+            {selected.author ? ` · ${selected.author}` : ""}
+          </div>
+        </div>
+      </div>
+      {description && <p className="platform-description">{description}</p>}
+
+      {versions.length > 1 && (
+        <div className="version-selector">
+          <label className="version-label">
+            {t("downloads.selectVersion")}
+          </label>
+          <select
+            className="version-dropdown"
+            value={selectedFileId}
+            onChange={(e) => setSelectedFileId(e.target.value)}
+          >
+            {stableVersions.length > 0 &&
+              stableVersions.map((versionItem) => (
+                <option key={versionItem.id} value={versionItem.id}>
+                  v{versionItem.version}
+                  {latestStableFileId === versionItem.id
+                    ? ` (${t("downloads.latest")})`
+                    : ""}
+                </option>
+              ))}
+            {previewVersions.length > 0 && (
+              <optgroup label="Preview">
+                {previewVersions.map((versionItem) => (
+                  <option key={versionItem.id} value={versionItem.id}>
+                    v{versionItem.version}
+                  </option>
+                ))}
+              </optgroup>
+            )}
+          </select>
+        </div>
+      )}
+
+      <a href={downloadUrl} className="download-btn" download>
+        <Download size={18} strokeWidth={2.5} />
+        {t("downloads.downloadZip")}
+      </a>
+
+      <div className="file-details">
+        <div className="detail-row">
+          <span className="detail-label">{t("downloads.version")}:</span>
+          <span>{selected.version}</span>
+        </div>
+        <div className="detail-row">
+          <span className="detail-label">{t("downloads.size")}:</span>
+          <span>{selected.size}</span>
+        </div>
+        <div className="detail-row">
+          <span className="detail-label">{t("downloads.updated")}:</span>
+          <span>{updatedDate}</span>
+        </div>
+        <div className="sha256-row">
+          <span className="detail-label">SHA256:</span>
+          <div className="sha256">{selected.sha256}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+interface PluginsSectionProps {
+  pluginsIndex: DesktopIndex;
+}
+
+const PLUGIN_KIND_ORDER = ["bundle", "tool"];
+
+function PluginsSection({ pluginsIndex }: PluginsSectionProps) {
+  const { t } = useTranslation();
+  const kinds = Object.keys(pluginsIndex.platforms ?? {}).sort((a, b) => {
+    const ai = PLUGIN_KIND_ORDER.indexOf(a);
+    const bi = PLUGIN_KIND_ORDER.indexOf(b);
+    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+  });
+
+  function labelForKind(kind: string): string {
+    if (kind === "bundle") return t("downloads.kindBundle");
+    if (kind === "tool") return t("downloads.kindTool");
+    return kind;
+  }
+
+  return (
+    <div className="product-section">
+      <div className="product-header">
+        <h3 className="product-title">{t("downloads.pluginsTitle")}</h3>
+        <p className="product-description">{t("downloads.pluginsDesc")}</p>
+      </div>
+      {kinds.map((kind) => {
+        const ids = pluginsIndex.platforms[kind]?.versions ?? [];
+        const files = ids
+          .map((id) => pluginsIndex.files[id])
+          .filter((f): f is FileMetadata => Boolean(f));
+        if (files.length === 0) return null;
+        const latestByPluginId = latestFileIdByPluginId(files);
+        return (
+          <div key={kind} className="plugin-kind-block">
+            <div className="platform-grid">
+              {groupFilesByPluginId(files).map(({ pluginId, versions }) => {
+                const latestStableId = latestByPluginId.get(pluginId) ?? null;
+                const defaultVersion =
+                  versions.find((item) => item.id === latestStableId) ??
+                  versions[0];
+                return (
+                  <PluginCard
+                    key={pluginId}
+                    versions={[
+                      defaultVersion,
+                      ...versions.filter(
+                        (item) => item.id !== defaultVersion.id,
+                      ),
+                    ]}
+                    latestStableFileId={latestStableId}
+                    kindLabel={labelForKind(kind)}
+                  />
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -159,23 +468,16 @@ export default function Downloads() {
   const [loading, setLoading] = useState(true);
   const [isEmpty, setIsEmpty] = useState(false);
   const [desktopIndex, setDesktopIndex] = useState<DesktopIndex | null>(null);
+  const [pluginsIndex, setPluginsIndex] = useState<DesktopIndex | null>(null);
   const userOS = detectOS();
   const docsBase = docsPath.replace(/\/$/, "") || "/docs";
 
   useEffect(() => {
     async function loadDownloads() {
       try {
-        const CDN_BASE = "https://download.qwenpaw.agentscope.io";
-
-        console.log(
-          "Fetching main index from:",
-          `${CDN_BASE}/metadata/index.json`,
-        );
         const mainIndexResponse = await fetch(
           `${CDN_BASE}/metadata/index.json`,
         );
-
-        console.log("Main index response status:", mainIndexResponse.status);
 
         if (!mainIndexResponse.ok) {
           if (mainIndexResponse.status === 404) {
@@ -188,23 +490,17 @@ export default function Downloads() {
         }
 
         const mainIndex: MainIndex = await mainIndexResponse.json();
-        console.log("Main index data:", mainIndex);
 
         let hasDesktopData = false;
+        let hasPluginsData = false;
 
         if (mainIndex.products?.desktop) {
           const desktopIndexUrl = `${CDN_BASE}${mainIndex.products.desktop.index_url}`;
-          console.log("Fetching desktop index from:", desktopIndexUrl);
 
           const desktopIndexResponse = await fetch(desktopIndexUrl);
-          console.log(
-            "Desktop index response status:",
-            desktopIndexResponse.status,
-          );
 
           if (desktopIndexResponse.ok) {
             const desktopData: DesktopIndex = await desktopIndexResponse.json();
-            console.log("Desktop index data:", desktopData);
             setDesktopIndex(desktopData);
             hasDesktopData = true;
           } else {
@@ -217,8 +513,25 @@ export default function Downloads() {
           console.warn("No desktop product found in main index");
         }
 
-        if (!hasDesktopData) {
-          console.warn("No desktop data available, showing empty state");
+        if (mainIndex.products?.plugins) {
+          const pluginsIndexUrl = `${CDN_BASE}${mainIndex.products.plugins.index_url}`;
+
+          const pluginsIndexResponse = await fetch(pluginsIndexUrl);
+
+          if (pluginsIndexResponse.ok) {
+            const pluginsData: DesktopIndex = await pluginsIndexResponse.json();
+            setPluginsIndex(pluginsData);
+            hasPluginsData = Object.keys(pluginsData.files ?? {}).length > 0;
+          } else {
+            console.warn(
+              "Plugins index fetch failed with status:",
+              pluginsIndexResponse.status,
+            );
+          }
+        }
+
+        if (!hasDesktopData && !hasPluginsData) {
+          console.warn("No downloadable data available, showing empty state");
           setIsEmpty(true);
         }
 
@@ -274,21 +587,32 @@ export default function Downloads() {
                 <div className="platform-grid">
                   {Object.entries(desktopIndex.platforms).map(
                     ([platform, platformData]) => {
-                      const latestFileId = platformData.latest;
-                      const fileMetadata = desktopIndex.files[latestFileId];
+                      const platformVersions = (platformData.versions || [])
+                        .map((fileId) => desktopIndex.files[fileId])
+                        .filter((item): item is FileMetadata => Boolean(item))
+                        .sort((a, b) =>
+                          compareVersionDesc(a.version, b.version),
+                        );
 
-                      if (!fileMetadata) return null;
+                      if (platformVersions.length === 0) return null;
 
+                      const latestStable = platformVersions.find(
+                        (item) => !isPreviewVersion(item.version),
+                      );
+                      const defaultVersion =
+                        latestStable ?? platformVersions[0];
                       const isRecommended = platform === userOS;
-                      const allVersions = platformData.versions || [
-                        fileMetadata.version,
-                      ];
 
                       return (
                         <PlatformCard
                           key={platform}
-                          fileMetadata={fileMetadata}
-                          allVersions={allVersions}
+                          versions={[
+                            defaultVersion,
+                            ...platformVersions.filter(
+                              (item) => item.id !== defaultVersion.id,
+                            ),
+                          ]}
+                          latestStableFileId={latestStable?.id ?? null}
                           isRecommended={isRecommended}
                         />
                       );
@@ -297,6 +621,11 @@ export default function Downloads() {
                 </div>
               </div>
             )}
+
+            {pluginsIndex &&
+              Object.keys(pluginsIndex.files ?? {}).length > 0 && (
+                <PluginsSection pluginsIndex={pluginsIndex} />
+              )}
 
             <div className="product-section">
               <div className="product-header">

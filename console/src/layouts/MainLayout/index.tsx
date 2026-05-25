@@ -4,64 +4,84 @@ import { Routes, Route, useLocation, Navigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import Sidebar from "../Sidebar";
 import Header from "../Header";
-import ConsoleCronBubble from "../../components/ConsoleCronBubble";
+import ConsolePollService from "../../components/ConsolePollService";
 import { ChunkErrorBoundary } from "../../components/ChunkErrorBoundary";
-import { lazyWithRetry } from "../../utils/lazyWithRetry";
+import { lazyImportWithRetry } from "../../utils/lazyWithRetry";
+import { usePlugins } from "../../plugins/PluginContext";
+import { useCodingMode } from "../../stores/codingModeStore";
+import { useSyncCodingMode } from "../../stores/useSyncCodingMode";
 import styles from "../index.module.less";
 
 // Chat is eagerly loaded (default landing page)
 import Chat from "../../pages/Chat";
+// Coding Mode IDE page
+import CodingPage from "../../pages/Coding";
 
 // All other pages are lazily loaded with automatic retry on chunk failure
-const ChannelsPage = lazyWithRetry(
-  () => import("../../pages/Control/Channels"),
+const ChannelsPage = lazyImportWithRetry("../../pages/Control/Channels");
+const SessionsPage = lazyImportWithRetry("../../pages/Control/Sessions");
+const InboxPage = lazyImportWithRetry("../../pages/Inbox");
+const CronJobsPage = lazyImportWithRetry("../../pages/Control/CronJobs");
+const HeartbeatPage = lazyImportWithRetry("../../pages/Control/Heartbeat");
+const AgentConfigPage = lazyImportWithRetry("../../pages/Agent/Config");
+const SkillsPage = lazyImportWithRetry("../../pages/Agent/Skills");
+const SkillPoolPage = lazyImportWithRetry("../../pages/Settings/SkillPool");
+const MarketPage = lazyImportWithRetry("../../pages/Settings/Market");
+const ToolsPage = lazyImportWithRetry("../../pages/Agent/Tools");
+const WorkspacePage = lazyImportWithRetry("../../pages/Agent/Workspace");
+const MCPPage = lazyImportWithRetry("../../pages/Agent/MCP");
+const ACPPage = lazyImportWithRetry("../../pages/Agent/ACP");
+const ModelsPage = lazyImportWithRetry("../../pages/Settings/Models");
+const EnvironmentsPage = lazyImportWithRetry(
+  "../../pages/Settings/Environments",
 );
-const SessionsPage = lazyWithRetry(
-  () => import("../../pages/Control/Sessions"),
+const SecurityPage = lazyImportWithRetry("../../pages/Settings/Security");
+const TokenUsagePage = lazyImportWithRetry("../../pages/Settings/TokenUsage");
+const AgentStatsPage = lazyImportWithRetry("../../pages/Settings/AgentStats");
+const VoiceTranscriptionPage = lazyImportWithRetry(
+  "../../pages/Settings/VoiceTranscription",
 );
-const CronJobsPage = lazyWithRetry(
-  () => import("../../pages/Control/CronJobs"),
+const AgentsPage = lazyImportWithRetry("../../pages/Settings/Agents");
+const DebugPage = lazyImportWithRetry("../../pages/Settings/Debug");
+const BackupsPage = lazyImportWithRetry("../../pages/Settings/Backups");
+const PluginManagerPage = lazyImportWithRetry(
+  "../../pages/Settings/PluginManager",
 );
-const HeartbeatPage = lazyWithRetry(
-  () => import("../../pages/Control/Heartbeat"),
-);
-const AgentConfigPage = lazyWithRetry(() => import("../../pages/Agent/Config"));
-const SkillsPage = lazyWithRetry(() => import("../../pages/Agent/Skills"));
-const SkillPoolPage = lazyWithRetry(
-  () => import("../../pages/Settings/SkillPool"),
-);
-const ToolsPage = lazyWithRetry(() => import("../../pages/Agent/Tools"));
-const WorkspacePage = lazyWithRetry(
-  () => import("../../pages/Agent/Workspace"),
-);
-const MCPPage = lazyWithRetry(() => import("../../pages/Agent/MCP"));
-const ModelsPage = lazyWithRetry(() => import("../../pages/Settings/Models"));
-const EnvironmentsPage = lazyWithRetry(
-  () => import("../../pages/Settings/Environments"),
-);
-const SecurityPage = lazyWithRetry(
-  () => import("../../pages/Settings/Security"),
-);
-const TokenUsagePage = lazyWithRetry(
-  () => import("../../pages/Settings/TokenUsage"),
-);
-const VoiceTranscriptionPage = lazyWithRetry(
-  () => import("../../pages/Settings/VoiceTranscription"),
-);
-const AgentsPage = lazyWithRetry(() => import("../../pages/Settings/Agents"));
 
 const { Content } = Layout;
 
+// Route "/" lands here. Waits for useSyncCodingMode to populate the store
+// from the backend before deciding where to send the user — otherwise we
+// would flash /chat first and the toggle button would desync with the
+// rendered page.
+function DefaultRedirect() {
+  const { t } = useTranslation();
+  const { codingMode, initialized } = useCodingMode();
+  if (!initialized) {
+    return (
+      <Spin
+        tip={t("common.loading")}
+        style={{ display: "block", margin: "20vh auto" }}
+      />
+    );
+  }
+  return <Navigate to={codingMode ? "/coding" : "/chat"} replace />;
+}
+
 const pathToKey: Record<string, string> = {
   "/chat": "chat",
+  "/coding": "chat",
   "/channels": "channels",
   "/sessions": "sessions",
+  "/inbox": "inbox",
   "/cron-jobs": "cron-jobs",
   "/heartbeat": "heartbeat",
   "/skills": "skills",
   "/skill-pool": "skill-pool",
+  "/market": "market",
   "/tools": "tools",
   "/mcp": "mcp",
+  "/acp": "acp",
   "/workspace": "workspace",
   "/agents": "agents",
   "/models": "models",
@@ -69,14 +89,33 @@ const pathToKey: Record<string, string> = {
   "/agent-config": "agent-config",
   "/security": "security",
   "/token-usage": "token-usage",
+  "/agent-stats": "agent-stats",
   "/voice-transcription": "voice-transcription",
+  "/debug": "debug",
+  "/backups": "backups",
+  "/plugin-manager": "plugin-manager",
 };
 
 export default function MainLayout() {
   const { t } = useTranslation();
   const location = useLocation();
   const currentPath = location.pathname;
-  const selectedKey = pathToKey[currentPath] || "chat";
+  const { pluginRoutes } = usePlugins();
+
+  // Backend is the source of truth for Coding Mode state — refill the
+  // in-memory store every time the selected agent changes.
+  useSyncCodingMode();
+
+  // Resolve selected key: check static routes first, then plugin routes
+  let selectedKey = pathToKey[currentPath] || "";
+  if (!selectedKey) {
+    const matchedPlugin = pluginRoutes.find(
+      (route) => currentPath === route.path,
+    );
+    selectedKey = matchedPlugin
+      ? matchedPlugin.path.replace(/^\//, "")
+      : "chat";
+  }
 
   return (
     <Layout className={styles.mainLayout}>
@@ -84,7 +123,7 @@ export default function MainLayout() {
       <Layout>
         <Sidebar selectedKey={selectedKey} />
         <Content className="page-container">
-          <ConsoleCronBubble />
+          <ConsolePollService />
           <div className="page-content">
             <ChunkErrorBoundary resetKey={currentPath}>
               <Suspense
@@ -96,16 +135,21 @@ export default function MainLayout() {
                 }
               >
                 <Routes>
-                  <Route path="/" element={<Navigate to="/chat" replace />} />
+                  <Route path="/" element={<DefaultRedirect />} />
                   <Route path="/chat/*" element={<Chat />} />
+                  <Route path="/coding" element={<CodingPage />} />
                   <Route path="/channels" element={<ChannelsPage />} />
                   <Route path="/sessions" element={<SessionsPage />} />
+                  <Route path="/inbox" element={<InboxPage />} />
                   <Route path="/cron-jobs" element={<CronJobsPage />} />
                   <Route path="/heartbeat" element={<HeartbeatPage />} />
                   <Route path="/skills" element={<SkillsPage />} />
                   <Route path="/skill-pool" element={<SkillPoolPage />} />
+                  <Route path="/market" element={<MarketPage />} />
                   <Route path="/tools" element={<ToolsPage />} />
                   <Route path="/mcp" element={<MCPPage />} />
+                  <Route path="/acp" element={<ACPPage />} />
+                  <Route path="/ACP" element={<Navigate to="/acp" replace />} />
                   <Route path="/workspace" element={<WorkspacePage />} />
                   <Route path="/agents" element={<AgentsPage />} />
                   <Route path="/models" element={<ModelsPage />} />
@@ -113,10 +157,26 @@ export default function MainLayout() {
                   <Route path="/agent-config" element={<AgentConfigPage />} />
                   <Route path="/security" element={<SecurityPage />} />
                   <Route path="/token-usage" element={<TokenUsagePage />} />
+                  <Route path="/agent-stats" element={<AgentStatsPage />} />
                   <Route
                     path="/voice-transcription"
                     element={<VoiceTranscriptionPage />}
                   />
+                  <Route path="/debug" element={<DebugPage />} />
+                  <Route path="/backups" element={<BackupsPage />} />
+                  <Route
+                    path="/plugin-manager"
+                    element={<PluginManagerPage />}
+                  />
+
+                  {/* Plugin routes — dynamically injected at runtime */}
+                  {pluginRoutes.map((route) => (
+                    <Route
+                      key={route.path}
+                      path={route.path}
+                      element={<route.component />}
+                    />
+                  ))}
                 </Routes>
               </Suspense>
             </ChunkErrorBoundary>

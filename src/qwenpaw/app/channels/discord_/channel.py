@@ -10,7 +10,7 @@ import tempfile
 from collections import deque
 from pathlib import Path
 from urllib.parse import urlparse
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import aiohttp
 from agentscope_runtime.engine.schemas.agent_schemas import (
@@ -63,6 +63,8 @@ class DiscordChannel(BaseChannel):
         deny_message: str = "",
         require_mention: bool = False,
         accept_bot_messages: bool = False,
+        access_control_dm: bool = False,
+        access_control_group: bool = False,
     ):
         super().__init__(
             process,
@@ -75,6 +77,8 @@ class DiscordChannel(BaseChannel):
             allow_from=allow_from,
             deny_message=deny_message,
             require_mention=require_mention,
+            access_control_dm=access_control_dm,
+            access_control_group=access_control_group,
         )
         self.enabled = enabled
         self.token = token
@@ -86,6 +90,10 @@ class DiscordChannel(BaseChannel):
         self._client = None
         self._processed_message_ids: set[str] = set()
         self._processed_message_id_queue: deque[str] = deque()
+        # Maps parent_channel_msg_id -> thread_id for race-condition
+        # detection when thread creation and first message arrive
+        # simultaneously.
+        self._recent_thread_starts: dict[str, str] = {}
 
         if self.enabled:
             import discord  # type: ignore
@@ -230,9 +238,35 @@ class DiscordChannel(BaseChannel):
                             )
 
                 is_group = message.guild is not None
+                _is_thread = isinstance(message.channel, discord.Thread)
+                _thread_started = (
+                    not _is_thread
+                    and getattr(message, "thread", None) is not None
+                )
+                # Race-condition: thread created simultaneously
+                # with the first message. on_thread_create may
+                # have cached the thread_id before on_message
+                # fires for the starter message.
+                _race_thread_id = None
+                if not _is_thread and not _thread_started and is_group:
+                    flags = getattr(message, "flags", None)
+                    if flags and getattr(flags, "has_thread", False):
+                        _race_thread_id = self._recent_thread_starts.get(
+                            str(message.id),
+                        )
+                # Determine effective channel_id for session routing
+                if _is_thread:
+                    _effective_channel_id = str(message.channel.id)
+                elif _thread_started:
+                    _effective_channel_id = str(message.thread.id)
+                elif _race_thread_id:
+                    _effective_channel_id = _race_thread_id
+                else:
+                    _effective_channel_id = str(message.channel.id)
+
                 meta = {
                     "user_id": str(message.author.id),
-                    "channel_id": str(message.channel.id),
+                    "channel_id": _effective_channel_id,
                     "guild_id": (
                         str(message.guild.id) if message.guild else None
                     ),
@@ -240,21 +274,20 @@ class DiscordChannel(BaseChannel):
                     "is_dm": not is_group,
                     "is_group": is_group,
                 }
+                if _is_thread:
+                    meta["is_thread"] = True
+                    meta["thread_id"] = str(message.channel.id)
+                    meta["parent_channel_id"] = (
+                        str(message.channel.parent_id)
+                        if message.channel.parent_id
+                        else None
+                    )
+                elif _thread_started or _race_thread_id:
+                    meta["is_thread"] = True
+                    meta["thread_id"] = _effective_channel_id
+                    meta["parent_channel_id"] = str(message.channel.id)
                 if is_bot_mentioned:
                     meta["bot_mentioned"] = True
-
-                allowed, error_msg = self._check_allowlist(
-                    str(message.author.id),
-                    is_group,
-                )
-                if not allowed:
-                    logger.info(
-                        "discord allowlist blocked: sender=%s is_group=%s",
-                        message.author.id,
-                        is_group,
-                    )
-                    await message.channel.send(error_msg or "")
-                    return
 
                 if not self._check_group_mention(is_group, meta):
                     return
@@ -262,6 +295,7 @@ class DiscordChannel(BaseChannel):
                 native = {
                     "channel_id": self.channel,
                     "sender_id": str(message.author),
+                    "acl_sender_id": str(message.author.id),
                     "content_parts": content_parts,
                     "meta": meta,
                 }
@@ -271,6 +305,27 @@ class DiscordChannel(BaseChannel):
                     logger.warning(
                         "discord: _enqueue not set, message dropped",
                     )
+
+            @self._client.event
+            async def on_thread_create(thread):
+                """Cache starter_message_id -> thread_id so on_message
+                can detect the race where a thread-starting message
+                arrives on the parent channel before the thread exists
+                in discord.py's cache."""
+                starter = getattr(thread, "starter_message", None)
+                if starter:
+                    key = str(starter.id)
+                    self._recent_thread_starts[key] = str(thread.id)
+                    logger.info(
+                        "discord thread_create: thread=%s "
+                        "starter_msg=%s parent=%s",
+                        thread.id,
+                        starter.id,
+                        thread.parent_id,
+                    )
+                    # Evict after 30s
+                    await asyncio.sleep(30)
+                    self._recent_thread_starts.pop(key, None)
 
     @classmethod
     def from_env(
@@ -334,6 +389,12 @@ class DiscordChannel(BaseChannel):
             deny_message=config.deny_message or "",
             require_mention=config.require_mention,
             accept_bot_messages=config.accept_bot_messages,
+            access_control_dm=bool(
+                getattr(config, "access_control_dm", False),
+            ),
+            access_control_group=bool(
+                getattr(config, "access_control_group", False),
+            ),
         )
 
     async def _resolve_target(self, to_handle, _meta):
@@ -574,6 +635,41 @@ class DiscordChannel(BaseChannel):
         if not self.enabled or not self.token or not self._client:
             return
         await self._client.start(self.token, reconnect=True)
+
+    async def health_check(self) -> Dict[str, Any]:
+        """Check Discord gateway connection status."""
+        if not self.enabled:
+            return {
+                "channel": self.channel,
+                "status": "disabled",
+                "detail": "Discord channel is disabled.",
+            }
+        if not self._client:
+            return {
+                "channel": self.channel,
+                "status": "unhealthy",
+                "detail": "Discord client not initialized.",
+            }
+        if not self._client.is_ready():
+            return {
+                "channel": self.channel,
+                "status": "unhealthy",
+                "detail": (
+                    "Discord client is not ready" " (gateway not connected)."
+                ),
+            }
+        task_alive = self._task is not None and not self._task.done()
+        if not task_alive:
+            return {
+                "channel": self.channel,
+                "status": "unhealthy",
+                "detail": "Discord gateway task is not running.",
+            }
+        return {
+            "channel": self.channel,
+            "status": "healthy",
+            "detail": "Discord gateway is connected and ready.",
+        }
 
     async def start(self) -> None:
         if not self.enabled:

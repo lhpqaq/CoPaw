@@ -4,6 +4,7 @@
 Provides utilities to get the correct agent instance for each request.
 """
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 from fastapi import Request
 from .multi_agent_manager import MultiAgentManager
@@ -21,6 +22,12 @@ _current_agent_id: ContextVar[Optional[str]] = ContextVar(
 # Context variable to store current session id across async calls
 _current_session_id: ContextVar[Optional[str]] = ContextVar(
     "current_session_id",
+    default=None,
+)
+
+# Context variable to store current root session id for cross-session approval
+_current_root_session_id: ContextVar[Optional[str]] = ContextVar(
+    "current_root_session_id",
     default=None,
 )
 
@@ -112,6 +119,27 @@ async def get_agent_for_request(
         ) from e
 
 
+def get_coding_dir(workspace: "Workspace") -> Path:
+    """Return the active coding project directory for *workspace*.
+
+    If the agent has set a ``coding_mode.project_dir`` in its config, that
+    path is returned.  Otherwise the agent's default ``workspace_dir`` is used.
+    """
+    from ..config.config import load_agent_config
+
+    try:
+        config = load_agent_config(workspace.agent_id)
+        project_dir = (
+            config.coding_mode.project_dir if config.coding_mode else None
+        )
+    except Exception:  # noqa: BLE001
+        project_dir = None
+
+    if project_dir:
+        return Path(project_dir).expanduser().resolve()
+    return workspace.workspace_dir
+
+
 def get_active_agent_id() -> str:
     """Get current active agent ID from config.
 
@@ -152,3 +180,21 @@ def set_current_session_id(session_id: str) -> None:
 
 def get_current_session_id() -> Optional[str]:
     return _current_session_id.get()
+
+
+def set_current_root_session_id(root_session_id: Optional[str]) -> None:
+    """Set current root session ID in context.
+
+    Args:
+        root_session_id: Root session ID to set
+    """
+    _current_root_session_id.set(root_session_id)
+
+
+def get_current_root_session_id() -> Optional[str]:
+    """Get current root session ID from context.
+
+    Returns:
+        Root session ID or None
+    """
+    return _current_root_session_id.get()

@@ -72,6 +72,8 @@ class OneBotChannel(BaseChannel):
         deny_message: str = "",
         require_mention: bool = False,
         share_session_in_group: bool = False,
+        access_control_dm: bool = False,
+        access_control_group: bool = False,
     ):
         super().__init__(
             process,
@@ -84,6 +86,8 @@ class OneBotChannel(BaseChannel):
             allow_from=allow_from,
             deny_message=deny_message,
             require_mention=require_mention,
+            access_control_dm=access_control_dm,
+            access_control_group=access_control_group,
         )
         self.enabled = enabled
         self.bot_prefix = bot_prefix
@@ -167,11 +171,52 @@ class OneBotChannel(BaseChannel):
                 "share_session_in_group",
                 False,
             ),
+            access_control_dm=bool(
+                getattr(config, "access_control_dm", False),
+            ),
+            access_control_group=bool(
+                getattr(config, "access_control_group", False),
+            ),
         )
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    async def health_check(self) -> Dict[str, Any]:
+        """Check OneBot reverse WebSocket server status."""
+        if not self.enabled:
+            return {
+                "channel": self.channel,
+                "status": "disabled",
+                "detail": "OneBot channel is disabled.",
+            }
+        if self._site is None:
+            return {
+                "channel": self.channel,
+                "status": "unhealthy",
+                "detail": "WebSocket server is not running.",
+            }
+        connection_count = len(self._connections)
+        if connection_count == 0:
+            return {
+                "channel": self.channel,
+                "status": "healthy",
+                "detail": (
+                    f"WebSocket server listening on "
+                    f"{self._ws_host}:{self._ws_port}, "
+                    f"no active connections."
+                ),
+            }
+        return {
+            "channel": self.channel,
+            "status": "healthy",
+            "detail": (
+                f"WebSocket server listening on "
+                f"{self._ws_host}:{self._ws_port}, "
+                f"{connection_count} active connection(s)."
+            ),
+        }
 
     async def start(self) -> None:
         if not self.enabled:
@@ -342,14 +387,6 @@ class OneBotChannel(BaseChannel):
             "bot_mentioned": bot_mentioned,
         }
 
-        # Allowlist check
-        allowed, deny_msg = self._check_allowlist(user_id, is_group)
-        if not allowed:
-            if deny_msg:
-                to = f"group:{group_id}" if is_group else user_id
-                await self.send(to, deny_msg, meta)
-            return
-
         # Mention check (group messages may require @bot)
         if not self._check_group_mention(is_group, meta):
             return
@@ -363,6 +400,7 @@ class OneBotChannel(BaseChannel):
 
         request = self.build_agent_request_from_native(native)
         request.channel_meta = meta
+        request.acl_sender_id = user_id
 
         logger.info(
             "onebot recv %s from=%s%s text=%r",

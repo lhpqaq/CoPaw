@@ -6,7 +6,7 @@ import json
 import uuid
 import logging
 import threading
-from typing import Any, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import paho.mqtt.client as mqtt
 from paho.mqtt import MQTTException
@@ -55,6 +55,8 @@ class MQTTChannel(BaseChannel):
         show_tool_details: bool = True,
         filter_tool_messages: bool = False,
         filter_thinking: bool = False,
+        access_control_dm: bool = False,
+        access_control_group: bool = False,
     ):
         super().__init__(
             process,
@@ -62,6 +64,8 @@ class MQTTChannel(BaseChannel):
             show_tool_details=show_tool_details,
             filter_tool_messages=filter_tool_messages,
             filter_thinking=filter_thinking,
+            access_control_dm=access_control_dm,
+            access_control_group=access_control_group,
         )
 
         self.enabled = enabled
@@ -163,8 +167,13 @@ class MQTTChannel(BaseChannel):
                 transport=config.get("transport", "tcp"),
                 on_reply_sent=on_reply_sent,
                 show_tool_details=show_tool_details,
-                filter_tool_messages=filter_tool_messages,
                 filter_thinking=filter_thinking,
+                access_control_dm=bool(
+                    config.get("access_control_dm", False),
+                ),
+                access_control_group=bool(
+                    config.get("access_control_group", False),
+                ),
             )
         port = int(config.port) if config.port else 1883
 
@@ -192,6 +201,12 @@ class MQTTChannel(BaseChannel):
             show_tool_details=show_tool_details,
             filter_tool_messages=filter_tool_messages,
             filter_thinking=filter_thinking,
+            access_control_dm=bool(
+                getattr(config, "access_control_dm", False),
+            ),
+            access_control_group=bool(
+                getattr(config, "access_control_group", False),
+            ),
         )
 
     def _validate_config(self):
@@ -283,6 +298,32 @@ class MQTTChannel(BaseChannel):
                 f"Error processing MQTT message: {str(e)}",
                 exc_info=True,
             )
+
+    async def health_check(self) -> Dict[str, Any]:
+        """Check MQTT broker connection status."""
+        if not self.enabled:
+            return {
+                "channel": self.channel,
+                "status": "disabled",
+                "detail": "MQTT channel is disabled.",
+            }
+        if self.client is None:
+            return {
+                "channel": self.channel,
+                "status": "unhealthy",
+                "detail": "MQTT client not initialized.",
+            }
+        if not self.connected:
+            return {
+                "channel": self.channel,
+                "status": "unhealthy",
+                "detail": "MQTT client is not connected to broker.",
+            }
+        return {
+            "channel": self.channel,
+            "status": "healthy",
+            "detail": f"MQTT connected to {self.host}:{self.port}.",
+        }
 
     async def start(self) -> None:
         if not self.enabled:

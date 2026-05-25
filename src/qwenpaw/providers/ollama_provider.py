@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
-"""An OpenAI provider implementation."""
-
-from __future__ import annotations
+"""An Ollama provider implementation."""
 
 import os
 from typing import Any
@@ -9,7 +7,6 @@ from typing import Any
 from agentscope.model import ChatModelBase
 from openai import AsyncOpenAI
 
-from qwenpaw.providers.provider import ModelInfo
 from qwenpaw.providers.openai_provider import OpenAIProvider
 
 
@@ -45,41 +42,39 @@ class OllamaProvider(OpenAIProvider):
         self.base_url = self._normalize_base_url(self.base_url)
 
     def _client(self, timeout: float = 5) -> AsyncOpenAI:
-        return AsyncOpenAI(
-            base_url=self._openai_compatible_base_url(),
-            api_key=self.api_key,
-            timeout=timeout,
-        )
+        kwargs: dict = {
+            "base_url": self._openai_compatible_base_url(),
+            "api_key": self.api_key,
+            "timeout": timeout,
+        }
+        headers = self._build_default_headers()
+        if headers:
+            kwargs["default_headers"] = headers
+        return AsyncOpenAI(**kwargs)
 
-    async def add_model(
-        self,
-        model_info: ModelInfo,
-        target: str = "models",
-        timeout: float = 36000,
-    ) -> tuple[bool, str]:
-        raise NotImplementedError(
-            "Please add models directly in Ollama or use "
-            "`ollama pull <model>` CLI command.",
-        )
-
-    async def delete_model(
+    async def check_model_connection(
         self,
         model_id: str,
-        timeout: float = 60,
+        timeout: float = 5,
     ) -> tuple[bool, str]:
-        raise NotImplementedError(
-            "Please delete models directly in Ollama or use "
-            "`ollama rm <model>` CLI command.",
-        )
+        """Check if a specific model is reachable/usable"""
+        models = await self.fetch_models(timeout=timeout)
+        if any(model.id == model_id for model in models):
+            return True, ""
+        return False, f"Model '{model_id}' not found"
 
     def get_chat_model_instance(self, model_id: str) -> ChatModelBase:
         from .openai_chat_model_compat import OpenAIChatModelCompat
 
+        client_kwargs: dict = {"base_url": self._openai_compatible_base_url()}
+        headers = self._build_default_headers()
+        if headers:
+            client_kwargs["default_headers"] = headers
         return OpenAIChatModelCompat(
             model_name=model_id,
             stream=True,
             api_key=self.api_key,
             stream_tool_parsing=False,
-            client_kwargs={"base_url": self._openai_compatible_base_url()},
+            client_kwargs=client_kwargs,
             generate_kwargs=self.get_effective_generate_kwargs(model_id),
         )

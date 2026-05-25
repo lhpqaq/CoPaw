@@ -27,7 +27,11 @@
 
   &:hover {
     border-radius: 6px;
-    background: var(--color-fill-tertiary, rgba(43, 18, 0, 0.03));
+    background-color: var(--colorBgBase, #fff);
+    background-image: linear-gradient(
+      var(--color-fill-tertiary, rgba(43, 18, 0, 0.03)),
+      var(--color-fill-tertiary, rgba(43, 18, 0, 0.03))
+    );
 
     .actions {
       opacity: 1;
@@ -51,6 +55,12 @@
   &.active {
     border-radius: 6px;
     background: var(--color-fill-tertiary, rgba(43, 18, 0, 0.03));
+  }
+
+  &.disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    pointer-events: none;
   }
 
   // Reserve right-side padding for the edit input in editing mode

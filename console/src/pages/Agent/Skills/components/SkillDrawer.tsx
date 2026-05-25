@@ -7,6 +7,7 @@ import type { FormInstance } from "antd";
 import type { SkillSpec } from "../../../../api/types";
 import { MarkdownCopy } from "../../../../components/MarkdownCopy/MarkdownCopy";
 import { api } from "../../../../api";
+import { deriveInstalledFromLabel } from "../../../../utils/skill";
 
 /** Parse YAML frontmatter from a `---`-delimited content string. */
 export function parseFrontmatter(
@@ -66,6 +67,7 @@ interface SkillDrawerProps {
   open: boolean;
   editingSkill: SkillSpec | null;
   form: FormInstance<SkillDrawerFormValues>;
+  availableTags?: string[];
   onClose: () => void;
   onSubmit: (values: SkillSpec) => void;
   onContentChange?: (content: string) => void;
@@ -75,6 +77,7 @@ export function SkillDrawer({
   open,
   editingSkill,
   form,
+  availableTags = [],
   onClose,
   onSubmit,
   onContentChange,
@@ -344,7 +347,10 @@ export function SkillDrawer({
         >
           <Select
             mode="tags"
-            open={false}
+            options={availableTags.map((tag) => ({
+              label: tag,
+              value: tag,
+            }))}
             placeholder={t("skillPool.tagsPlaceholder")}
             maxCount={MAX_TAGS}
           />
@@ -370,6 +376,12 @@ export function SkillDrawer({
           <>
             <Form.Item name="source" label={t("skills.type")}>
               <Input disabled />
+            </Form.Item>
+            <Form.Item label={t("skills.installedFrom")}>
+              <Input
+                disabled
+                value={deriveInstalledFromLabel(editingSkill.installed_from)}
+              />
             </Form.Item>
           </>
         )}
